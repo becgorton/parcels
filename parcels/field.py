@@ -11,7 +11,7 @@ import xarray as xr
 import datetime
 import math
 from .grid import Grid, CGrid, GridCode
-
+from scipy import spatial
 
 __all__ = ['Field', 'VectorField', 'SummedField', 'NestedField']
 
@@ -663,12 +663,105 @@ class Field(object):
             raise FieldSamplingError(x, y, z, field=self)
 
         return (xsi, eta, zeta, xi, yi, zi)
+    
+    
+    def search_KDTree_indices_curvilinear(self, x, y, z, xi, yi, ti=-1, time=-1, search2D=False):
+        xsi = eta = -1
+        grid = self.grid
+        invA = np.array([[1, 0, 0, 0],
+                         [-1, 1, 0, 0],
+                         [-1, 0, 0, 1],
+                         [1, -1, 1, -1]])
+        maxIterSearch = 1e6
+        it = 0
+        if not grid.zonal_periodic:
+            if x < grid.lonlat_minmax[0] or x > grid.lonlat_minmax[1]:
+                if grid.lon[0, 0] < grid.lon[0, -1]:
+                    raise FieldOutOfBoundError(x, y, z, field=self)
+                elif x < grid.lon[0, 0] and x > grid.lon[0, -1]:  # This prevents from crashing in [160, -160]
+                    raise FieldOutOfBoundError(x, y, z, field=self)
+        if y < grid.lonlat_minmax[2] or y > grid.lonlat_minmax[3]:
+            raise FieldOutOfBoundError(x, y, z, field=self)
+
+        indices = np.argwhere(~np.isnan(grid.lon))
+        x_centre = grid.lon[~np.isnan(grid.lon)]
+        y_centre = grid.lat[~np.isnan(grid.lat)]
+        tree = spatial.KDTree(list(zip(x_centre, y_centre)))
+
+        [d, i] = tree.query([x, y])
+        xi = indices[i][0]
+        yi = indices[i][1]
+        
+        print(grid.lon[yi, xi])
+        print(grid.lat[yi, xi])
+
+        #while xsi < 0 or xsi > 1 or eta < 0 or eta > 1:
+        px = np.array([grid.lon[yi, xi], grid.lon[yi, xi+1], grid.lon[yi+1, xi+1], grid.lon[yi+1, xi]])
+        if grid.mesh == 'spherical':
+            px[0] = px[0]+360 if px[0] < x-225 else px[0]
+            px[0] = px[0]-360 if px[0] > x+225 else px[0]
+            px[1:] = np.where(px[1:] - px[0] > 180, px[1:]-360, px[1:])
+            px[1:] = np.where(-px[1:] + px[0] > 180, px[1:]+360, px[1:])
+        py = np.array([grid.lat[yi, xi], grid.lat[yi, xi+1], grid.lat[yi+1, xi+1], grid.lat[yi+1, xi]])
+        a = np.dot(invA, px)
+        b = np.dot(invA, py)
+
+        aa = a[3]*b[2] - a[2]*b[3]
+        bb = a[3]*b[0] - a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + x*b[3] - y*a[3]
+        cc = a[1]*b[0] - a[0]*b[1] + x*b[1] - y*a[1]
+        if abs(aa) < 1e-12:  # Rectilinear cell, or quasi
+            eta = -cc / bb
+        else:
+            det2 = bb*bb-4*aa*cc
+            if det2 > 0:  # so, if det is nan we keep the xsi, eta from previous iter
+                det = np.sqrt(det2)
+                eta = (-bb+det)/(2*aa)
+        if abs(a[1]+a[3]*eta) < 1e-12:  # this happens when recti cell rotated of 90deg
+            xsi = ((y-py[0])/(py[1]-py[0]) + (y-py[3])/(py[2]-py[3])) * .5
+        else:
+            xsi = (x-a[0]-a[2]*eta) / (a[1]+a[3]*eta)
+        if xsi < 0 and eta < 0 and xi == 0 and yi == 0:
+            raise FieldOutOfBoundError(x, y, 0, field=self)
+        if xsi > 1 and eta > 1 and xi == grid.xdim-1 and yi == grid.ydim-1:
+            raise FieldOutOfBoundError(x, y, 0, field=self)
+        if xsi < 0:
+            xi -= 1
+        elif xsi > 1:
+            xi += 1
+        if eta < 0:
+            yi -= 1
+        elif eta > 1:
+            yi += 1
+        (xi, yi) = self.reconnect_bnd_indices(xi, yi, grid.xdim, grid.ydim, grid.mesh)
+        it += 1
+        if it > maxIterSearch:
+            print('Correct cell not found after %d iterations' % maxIterSearch)
+            raise FieldOutOfBoundError(x, y, 0, field=self)
+
+        if grid.zdim > 1 and not search2D:
+            if grid.gtype == GridCode.CurvilinearZGrid:
+                try:
+                    (zi, zeta) = self.search_indices_vertical_z(z)
+                except FieldOutOfBoundError:
+                    raise FieldOutOfBoundError(x, y, z, field=self)
+            elif grid.gtype == GridCode.CurvilinearSGrid:
+                (zi, zeta) = self.search_indices_vertical_s(x, y, z, xi, yi, xsi, eta, ti, time)
+        else:
+            zi = -1
+            zeta = 0
+
+        if not ((0 <= xsi <= 1) and (0 <= eta <= 1) and (0 <= zeta <= 1)):
+            raise FieldSamplingError(x, y, z, field=self)
+
+        return (xsi, eta, zeta, xi, yi, zi)
+    
 
     def search_indices(self, x, y, z, xi, yi, ti=-1, time=-1, search2D=False):
         if self.grid.gtype in [GridCode.RectilinearSGrid, GridCode.RectilinearZGrid]:
             return self.search_indices_rectilinear(x, y, z, ti, time, search2D=search2D)
         else:
-            return self.search_indices_curvilinear(x, y, z, xi, yi, ti, time, search2D=search2D)
+            #return self.search_indices_curvilinear(x, y, z, xi, yi, ti, time, search2D=search2D)
+            return search_KDTree_indices_curvilinear(x, y, z, xi, yi, ti, time, search2D=search2D)
 
     def interpolator2D(self, ti, z, y, x):
         xi = 0
