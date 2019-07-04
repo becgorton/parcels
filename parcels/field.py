@@ -12,6 +12,8 @@ import datetime
 import math
 from .grid import Grid, CGrid, GridCode
 from scipy import spatial
+import pyindex.core as core
+from parcels.rtree_util import get_relative_coordinates
 
 __all__ = ['Field', 'VectorField', 'SummedField', 'NestedField']
 
@@ -74,6 +76,38 @@ class Field(object):
         # Those variables are still defined for backwards compatibility with users codes.
         self.lon = self.grid.lon
         self.lat = self.grid.lat
+        if np.nanmax(self.grid.lon) > 180:
+            self.grid.lon = self.grid.lon - 360
+    
+        
+        self.fs_glon = np.array(self.grid.lon, dtype=np.float64)
+        self.fs_glat = np.array(self.grid.lat, dtype=np.float64)
+
+        
+        self.tree_indices = np.argwhere(~np.isnan(self.fs_glon))
+        #print(self.tree_indices.shape)
+        #print(grid.lon)
+        self.x_centre = grid.lon[~np.isnan(self.fs_glon)]
+        #print(self.x_centre)
+        self.y_centre = grid.lat[~np.isnan(self.fs_glat)]
+        
+        '''
+        self.tree = spatial.KDTree(list(zip(self.x_centre, self.y_centre)))
+        #print(self.tree)
+        
+    
+        '''
+        system = core.geodetic.System()
+        self.tree = core.geodetic.RTree()
+
+        self.tree.packing(np.asarray((self.x_centre, self.y_centre)).T)
+        
+        self.fs_glon = np.array(self.grid.lon, dtype=np.float64)
+        self.fs_glat = np.array(self.grid.lat, dtype=np.float64)
+
+
+
+        
         self.depth = self.grid.depth
         self.fieldtype = self.name if fieldtype is None else fieldtype
         if self.grid.mesh == 'flat' or (self.fieldtype not in unitconverters_map.keys()):
@@ -594,6 +628,7 @@ class Field(object):
                          [-1, 0, 0, 1],
                          [1, -1, 1, -1]])
         maxIterSearch = 1e6
+        print(grid.mesh)
         it = 0
         if not grid.zonal_periodic:
             if x < grid.lonlat_minmax[0] or x > grid.lonlat_minmax[1]:
@@ -604,16 +639,22 @@ class Field(object):
         if y < grid.lonlat_minmax[2] or y > grid.lonlat_minmax[3]:
             raise FieldOutOfBoundError(x, y, z, field=self)
 
+        print(grid.lon)
+        print(grid.lat)
         while xsi < 0 or xsi > 1 or eta < 0 or eta > 1:
+            print(yi, xi)
             px = np.array([grid.lon[yi, xi], grid.lon[yi, xi+1], grid.lon[yi+1, xi+1], grid.lon[yi+1, xi]])
             if grid.mesh == 'spherical':
                 px[0] = px[0]+360 if px[0] < x-225 else px[0]
                 px[0] = px[0]-360 if px[0] > x+225 else px[0]
                 px[1:] = np.where(px[1:] - px[0] > 180, px[1:]-360, px[1:])
                 px[1:] = np.where(-px[1:] + px[0] > 180, px[1:]+360, px[1:])
+            print(px)
             py = np.array([grid.lat[yi, xi], grid.lat[yi, xi+1], grid.lat[yi+1, xi+1], grid.lat[yi+1, xi]])
             a = np.dot(invA, px)
             b = np.dot(invA, py)
+            print(a)
+            print(b)
 
             aa = a[3]*b[2] - a[2]*b[3]
             bb = a[3]*b[0] - a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + x*b[3] - y*a[3]
@@ -646,7 +687,7 @@ class Field(object):
             if it > maxIterSearch:
                 print('Correct cell not found after %d iterations' % maxIterSearch)
                 raise FieldOutOfBoundError(x, y, 0, field=self)
-
+            break
         if grid.zdim > 1 and not search2D:
             if grid.gtype == GridCode.CurvilinearZGrid:
                 try:
@@ -659,13 +700,121 @@ class Field(object):
             zi = -1
             zeta = 0
 
+        #print(xsi, eta)
         if not ((0 <= xsi <= 1) and (0 <= eta <= 1) and (0 <= zeta <= 1)):
             raise FieldSamplingError(x, y, z, field=self)
 
         return (xsi, eta, zeta, xi, yi, zi)
     
+    '''    
+    def get_relative_coordinates(self, glon, glat, lon, lat, xi, yi):
+
+        invA = np.array([[1, 0, 0, 0],
+                         [-1, 1, 0, 0],
+                         [-1, 0, 0, 1],
+                         [1, -1, 1, -1]])
+        px = np.array([glon[yi, xi], glon[yi, xi+1], glon[yi+1, xi+1], glon[yi+1, xi]])
+        #print(px)
+        px = np.where(px[:] - lon > 180, px-360, px)
+        px = np.where(px[:] - lon <-180, px+360, px)
+        py = np.array([glat[yi, xi], glat[yi, xi+1], glat[yi+1, xi+1], glat[yi+1, xi]])
+        a = np.dot(invA, px)
+        b = np.dot(invA, py)
+        
+        aa = a[3]*b[2] - a[2]*b[3]
+        bb = a[3]*b[0] - a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + lon*b[3] - lat*a[3]
+        cc = a[1]*b[0] - a[0]*b[1] + lon*b[1] - lat*a[1]
+        if abs(aa) < 1e-12:  # Rectilinear cell, or quasi
+            eta = -cc / bb
+        else:
+            det2 = bb*bb-4*aa*cc
+            if det2 > 0:  # so, if det is nan we keep the xsi, eta from previous iter
+                det = np.sqrt(det2)
+                eta = (-bb+det)/(2*aa)
+            else:  # should not happen, apart from singularities
+                eta = 1e6
+        if abs(a[1]+a[3]*eta) < 1e-12:  # this happens when recti cell rotated of 90deg
+            xsi = ((lat-py[0])/(py[1]-py[0]) + (lat-py[3])/(py[2]-py[3])) * .5
+        else:
+            xsi = (lon-a[0]-a[2]*eta) / (a[1]+a[3]*eta)
+        return(xsi, eta)
+    '''
+    
+    def find_cell(self, lon, lat, k=8):
+        #rint()
+        #print('calling find cell')
+        #print(lon, lat)
+        #if k > 2000:
+        if k > 8:
+            
+            print('find_cell should request k=2000 nearest neighbours in the rtree query')
+            #raise Exception
+            raise FieldOutOfBoundError(lon, lat, 0, field=self)
+        distance, index = self.tree.query([[lon, lat]], k=k)
+        #print(index)
+          
+        ndim, mdim = self.fs_glon.shape
+        num_values = len(index[0])
+        index_values = index[0].astype(int)
+
+        #yi_values = (index[0]/mdim).astype(np.int)
+        #xi_values = (index[0] % mdim).astype(np.int)
+        # print('yi_values = ' + str(yi_values))
+        #print('xi_values = ' + str(xi_values))
+        
+        xi_final = -1
+        yi_final = -1
+        for i in range(0, num_values):
+          
+            yi = self.tree_indices[index_values[i]][0]
+            xi = self.tree_indices[index_values[i]][1]
+            #print(xi, yi)
+            #print(self.grid.lon[yi, xi], self.grid.lat[yi, xi])
+            if yi == ndim-1 or xi == mdim-1 :
+                continue
+
+            (xsi, eta) = get_relative_coordinates(self.fs_glon, self.fs_glat, lon, lat, xi, yi)
+            #print((xsi, eta))
+            if xsi >= 0 and xsi <= 1 and eta >=0 and eta <= 1:
+                xi_final = xi
+                yi_final = yi
+                #print('sucess')
+                break
+        #print(xi_final, yi_final)
+        if xi_final == -1:
+            return self.find_cell(lon, lat, k=2*k)
+    
+        return xi_final, yi_final, xsi, eta
+    
+    def search_RTree_indices_curvilinear(self, x, y, z, xi, yi, ti=-1, time=-1, search2D=False):
+       # print('search_KDTree_indices_curvilinear')
+        xsi = eta = -1
+        grid = self.grid
+        
+        [xi, yi, xsi, eta] = self.find_cell(x, y)
+        
+        if grid.zdim > 1 and not search2D:
+            if grid.gtype == GridCode.CurvilinearZGrid:
+                try:
+                    (zi, zeta) = self.search_indices_vertical_z(z)
+                except FieldOutOfBoundError:
+                    raise FieldOutOfBoundError(x, y, z, field=self)
+            elif grid.gtype == GridCode.CurvilinearSGrid:
+                (zi, zeta) = self.search_indices_vertical_s(x, y, z, xi, yi, xsi, eta, ti, time)
+        else:
+            zi = -1
+            zeta = 0
+
+        #print(xsi, eta)
+        #if not ((0 <= xsi <= 1) and (0 <= eta <= 1) and (0 <= zeta <= 1)):
+            
+         #   print('pigel')
+          #  raise FieldSamplingError(x, y, z, field=self)
+
+        return (xsi, eta, zeta, xi, yi, zi)
     
     def search_KDTree_indices_curvilinear(self, x, y, z, xi, yi, ti=-1, time=-1, search2D=False):
+        #print('search_KDTree_indices_curvilinear')
         xsi = eta = -1
         grid = self.grid
         invA = np.array([[1, 0, 0, 0],
@@ -682,27 +831,60 @@ class Field(object):
                     raise FieldOutOfBoundError(x, y, z, field=self)
         if y < grid.lonlat_minmax[2] or y > grid.lonlat_minmax[3]:
             raise FieldOutOfBoundError(x, y, z, field=self)
-
+        '''
         indices = np.argwhere(~np.isnan(grid.lon))
+        print(indices)
+        #print(grid.lon)
         x_centre = grid.lon[~np.isnan(grid.lon)]
         y_centre = grid.lat[~np.isnan(grid.lat)]
         tree = spatial.KDTree(list(zip(x_centre, y_centre)))
-
-        [d, i] = tree.query([x, y])
-        xi = indices[i][0]
-        yi = indices[i][1]
+        #print(x_centre)
+        '''
         
+        # use the kdtree option.
+        [d, i] = self.tree.query([x, y])
+        #print(d, i)
+        #print(self.tree_indices.shape)
+        xi = self.tree_indices[i][1] + 1
+        yi = self.tree_indices[i][0] + 1
+        print(xi, yi)
+        print(x, y, z)
+        #
         print(grid.lon[yi, xi])
         print(grid.lat[yi, xi])
+        '''
+        
+        # use the pyindex code.        
+        distance, index =self.tree.query([[x, y]], k=10, within=True)
+        xi_values = [0] * len(index[0])
+        yi_values = [0] * len(index[0])
+        
+        ndim, mdim = grid.lon.shape
 
+        print(ndim, mdim)
+
+        print(index)
+        for i, ind in enumerate(index[0]):
+            yi_values[i] = int(int(ind) / mdim)
+            xi_values[i] = int(ind) % mdim
+
+        print(xi_values)
+        xi = self.tree_indices[xi_values[0]][0]
+        yi = self.tree_indices[xi_values[0]][1]
+        print(xi, yi)
+        print(x, y, z)
+        '''
+        
         #while xsi < 0 or xsi > 1 or eta < 0 or eta > 1:
         px = np.array([grid.lon[yi, xi], grid.lon[yi, xi+1], grid.lon[yi+1, xi+1], grid.lon[yi+1, xi]])
+        #print(px)
         if grid.mesh == 'spherical':
             px[0] = px[0]+360 if px[0] < x-225 else px[0]
             px[0] = px[0]-360 if px[0] > x+225 else px[0]
             px[1:] = np.where(px[1:] - px[0] > 180, px[1:]-360, px[1:])
             px[1:] = np.where(-px[1:] + px[0] > 180, px[1:]+360, px[1:])
         py = np.array([grid.lat[yi, xi], grid.lat[yi, xi+1], grid.lat[yi+1, xi+1], grid.lat[yi+1, xi]])
+        #print(py)
         a = np.dot(invA, px)
         b = np.dot(invA, py)
 
@@ -720,6 +902,8 @@ class Field(object):
             xsi = ((y-py[0])/(py[1]-py[0]) + (y-py[3])/(py[2]-py[3])) * .5
         else:
             xsi = (x-a[0]-a[2]*eta) / (a[1]+a[3]*eta)
+            
+        print(xsi, eta)
         if xsi < 0 and eta < 0 and xi == 0 and yi == 0:
             raise FieldOutOfBoundError(x, y, 0, field=self)
         if xsi > 1 and eta > 1 and xi == grid.xdim-1 and yi == grid.ydim-1:
@@ -750,8 +934,11 @@ class Field(object):
             zi = -1
             zeta = 0
 
-        if not ((0 <= xsi <= 1) and (0 <= eta <= 1) and (0 <= zeta <= 1)):
-            raise FieldSamplingError(x, y, z, field=self)
+        #print(xsi, eta)
+        #if not ((0 <= xsi <= 1) and (0 <= eta <= 1) and (0 <= zeta <= 1)):
+            
+         #   print('pigel')
+          #  raise FieldSamplingError(x, y, z, field=self)
 
         return (xsi, eta, zeta, xi, yi, zi)
     
@@ -761,11 +948,14 @@ class Field(object):
             return self.search_indices_rectilinear(x, y, z, ti, time, search2D=search2D)
         else:
             #return self.search_indices_curvilinear(x, y, z, xi, yi, ti, time, search2D=search2D)
-            return search_KDTree_indices_curvilinear(x, y, z, xi, yi, ti, time, search2D=search2D)
+            #return self.search_KDTree_indices_curvilinear(x, y, z, xi, yi, ti, time, search2D=search2D)
+            return self.search_RTree_indices_curvilinear(x, y, z, xi, yi, ti, time, search2D=search2D)
 
     def interpolator2D(self, ti, z, y, x):
         xi = 0
         yi = 0
+        #print(self.interp_method)
+
         (xsi, eta, _, xi, yi, _) = self.search_indices(x, y, z, xi, yi)
         if self.interp_method == 'nearest':
             xii = xi if xsi <= .5 else xi+1
@@ -785,6 +975,7 @@ class Field(object):
             raise RuntimeError(self.interp_method+" is not implemented for 2D grids")
 
     def interpolator3D(self, ti, z, y, x, time):
+        print(self.interp_method)
         xi = int(self.grid.xdim / 2) - 1
         yi = int(self.grid.ydim / 2) - 1
         (xsi, eta, zeta, xi, yi, zi) = self.search_indices(x, y, z, xi, yi, ti, time)

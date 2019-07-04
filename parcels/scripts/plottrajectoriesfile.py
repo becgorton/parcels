@@ -18,7 +18,7 @@ except:
 
 def plotTrajectoriesFile(filename, mode='2d', tracerfile=None, tracerfield='P',
                          tracerlon='x', tracerlat='y', recordedvar=None, movie_forward=True,
-                         bins=20, show_plt=True):
+                         bins=20, show_plt=True, domain=None):
     """Quick and simple plotting of Parcels trajectories
 
     :param filename: Name of Parcels-generated NetCDF file with particle positions
@@ -121,6 +121,10 @@ def plotTrajectoriesFile(filename, mode='2d', tracerfile=None, tracerfield='P',
         anim = animation.FuncAnimation(fig, animate, frames=frames, interval=100, blit=False)
     else:
         raise RuntimeError('mode %s not known' % mode)
+
+    if domain is not None:
+        ax.set_xlim(domain['E'],  domain['W'])
+        ax.set_ylim(domain['S'],  domain['N'])
 
     if mode == 'movie2d_notebook':
         plt.close()
